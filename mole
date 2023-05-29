@@ -1,0 +1,328 @@
+#!/bin/sh
+
+export POSIXLY_CORRECT=yes
+export LC_ALL=C
+
+
+#DEKLARACE PROMĚNNÝCH
+DATETIME=$(date +%Y-%m-%d_%H-%M-%S)
+DATE=$(date +%Y-%m-%d)
+DATE_A="0000-00-00" #default, všechna data jsou po tomto datu
+DATE_B="9999-99-99" #default, všechna data jsou před tímto datem
+DIRECTORY=""
+FILE=""
+LIST=false
+M=false
+SECRET=false
+
+
+#FUNKCE
+#nápověda
+print_help() {
+    echo ""
+    echo "Použití:                                                                                                                                  "
+    echo "      mole -h                           výpis této nápovědy                                                                               "
+    echo "      mole FILE                         otevření zadaného souboru                                                                         "
+    echo "      mole [-g GROUP] FILE              otevření zadaného souboru s přiřazením do skupiny                                                 "
+    echo "      mole [FILTERS] [DIRECTORY]        otevření posledně editovaného souboru v adresáři                                                  "
+    echo "      mole [-m] [FILTERS] [DIRECTORY]   otevření nejčastěji editovaného souboru v adresáři                                                "
+    echo "      mole list [FILTERS] [DIRECTORY]   zobrazí seznam souborů, které byly v adresáři otevřeny pomocí skriptu                             "
+    echo "      pokud nebyl zadán adresář, předpokládá se aktuální adresář                                                                          "
+    echo "                                                                                                                                          "
+    echo "Filtry: (každý může být uveden maximálně jednou)                                                                                          "
+    echo "      [-g GROUP1[,GROUP2[,...]]]        specifikace skupin, soubor bude uvažován pouze pokud spadá alespoň do jedné z těchto skupin       "
+    echo "      [-a DATE]                         pouze soubory po tomto datu budou uvažovány                                                       "
+    echo "      [-b DATE]                         pouze soubory před tímto datem budou uvažovány                                                    "
+    echo "      zadané datum musí být ve formátu YYYY-MM-DD                                                                                         "
+    echo ""
+}
+
+
+
+#kontrola nastavení MOLE_RC
+molerc_check () {
+    #pokud proměnná MOLE_RC není daná, chyba
+    if [ -z "$MOLE_RC" ]; then
+        echo "ERROR: Proměnná MOLE_RC není nastavena!">&2
+        exit 1
+    fi
+
+    #pokud soubor na cestě dané proměnnou MOLE_RC neexistuje, soubor bude vytvořen včetně cesty k danému souboru (pokud i ta neexistuje)
+    if [ ! -f "$MOLE_RC" ]; then
+        mkdir -p "$(dirname "$MOLE_RC")"
+        touch "$MOLE_RC"
+    fi
+
+    #MOLE_RC musí mít práva pro zápis
+    if [ ! -r "$MOLE_RC" ] || [ ! -w "$MOLE_RC" ]; then
+        echo "ERROR: Soubor $MOLE_RC nemá práva pro čtení nebo zápis">&2
+        exit 1
+    fi
+}
+
+
+
+#kontrola utility realpath
+realpath_check () {
+    REALPATH=$(realpath)
+    if [ -z "$REALPATH" ]; then
+        echo "ERROR: Na daném stroji není utilita realpath dostupná!">&2
+        exit 1
+    fi
+}
+
+
+
+#výběr editoru
+editor_select() {
+    if [ -z "$EDITOR" ]; then
+        EDITOR=$VISUAL
+        if [ -z "$VISUAL" ]; then
+            EDITOR="vi"
+        fi
+    fi
+    editor_check
+}
+
+
+
+#kontrola editoru
+editor_check () {
+    if  ! command -v "$EDITOR" >/dev/null 2>&1; then
+        echo "$EDITOR není validní editor.">&2
+        exit 1
+    fi
+}
+
+
+
+#testuje, zdali bylo zadáno platné datum
+date_validation () {
+    check=$(date -j -f "%Y-%m-%d" "$1" "+%Y-%m-%d" 2>/dev/null)
+    if [ "$check" != "$1" ]; then
+        echo "ERROR: Neplatné datum">&2
+        exit 1
+    fi
+}
+
+
+
+#filtruje dle zadaných dat, jinak v základu projdou všechna
+date_filter() {
+    awk -v start="$DATE_A" -v end="$DATE_B" '$3 >= start && $3 <= end {print}'
+}
+
+
+
+#soubor bude uvažován pouze tehdy, pokud jeho spuštění spadá alespoň do jedné z těchto skupin
+group_filter() {
+    grep -w -E "($(echo "$GROUP" | tr ',' '|'))" "$MOLE_RC"
+}
+
+
+
+#s parametrem -m vyberu nejčastěji editovaný soubor
+file_most_often_edited_in_directory() {
+    num_of_lines=$(grep "$DIRECTORY" "$MOLE_RC" | group_filter | date_filter | cut -d' ' -f1 | uniq | wc -l | awk '{print $1}')
+    i=1
+
+    while [ ! -f "$FILE" ]; do
+        FILE=$(grep "$DIRECTORY" "$MOLE_RC" | group_filter | date_filter | cut -d' ' -f1 | sort | uniq -c | sort -n | tail -n"$i" | head -n1 | awk '{print $2}')
+        if [ "$i" -eq "$num_of_lines" ]; then
+            if [ ! -f "$FILE" ]; then FILE=""; fi
+            break
+        fi
+        i=$(expr "$i" + 1)
+    done
+}
+
+
+
+#vyberu z adresáře poslední editovaný soubor
+file_last_edited_in_directory() {
+    num_of_lines=$(grep "$DIRECTORY" "$MOLE_RC" | group_filter | date_filter | wc -l | awk '{print $1}')
+    i=1
+
+    while [ ! -f "$FILE" ]; do
+        FILE=$(grep "$DIRECTORY" "$MOLE_RC" | group_filter | date_filter | tail -n"$i" | head -n1 | awk '{print $1}')
+        if [ "$i" -eq "$num_of_lines" ]; then
+            if [ ! -f "$FILE" ]; then FILE=""; fi
+            break
+        fi
+        i=$(expr "$i" + 1)
+    done
+}
+
+
+
+#když je použito -g pro filtry s více zadanými skupinami, tak to vynuluju před zápisem, ať to nemám v log file
+log_group() {
+    case "$GROUP" in
+        *,*) GROUP="" ;;
+    esac
+}
+
+
+
+#otevření souboru s logováním do molerc
+open_file_with_log () {
+    editor_select       #výběr editoru
+    log_group           #prevence zápisu GROUP použitých jako filtr
+    echo "$FILE $(dirname "$(realpath "$FILE")") $DATE $DATETIME $GROUP" >> "$MOLE_RC"     #zápis date i datetime pro jiná využití
+    $EDITOR "$FILE"                   
+}
+
+
+
+#zobrazí seznam souborů, které byly v daném adresáři editovány
+list_files() {
+    grep "$DIRECTORY" "$MOLE_RC" | group_filter | date_filter | cut -d' ' -f1,5 | sort -u |
+    awk '{
+            if (groups[$1]) {
+                groups[$1]=groups[$1]","$2
+            } else {
+                groups[$1]=$2
+            }
+            
+            if (length($1) > max_len) {
+                max_len = length($1)
+            }
+
+        } END {
+            for (filename in groups) {
+                if (!groups[filename]) {
+                    groups[filename]="-"   
+                }
+                printf "%-*s %s\n", max_len+1, sprintf("%s:", filename), groups[filename]
+            }
+        }' | sort
+}
+
+
+
+#když byly na vypsání secret-logu dány adresáře, tak se vyfiltrují
+dir_filter () {
+    awk -v dir="$DIRECTORY" 'BEGIN {
+                split(dir, dirs, " ")
+            } {
+                for (i=1; i<=length(dirs); ++i) {
+                    if ($2 == dirs[i]) {
+                        print $0
+                    }
+                }
+            }'
+}
+
+
+
+#sekvence pro formátování outputu secret-logu
+secret_log_seq () {
+    date_filter | cut -d' ' -f1,2,4 | sort -u | 
+    awk '{
+            if (datetime[$1]) {
+                datetime[$1]=datetime[$1]";"$3
+            } else {
+                datetime[$1]=$3
+            }
+
+            if (!paths[$1]) {
+                paths[$1]=$2
+            }
+
+        } END {
+            for (filename in datetime) {
+                printf "%s;%s\n", sprintf("%s/%s", paths[filename], filename), datetime[filename]
+            }
+        }' | sort
+}
+
+
+
+#extrahování dat z MOLE_RC do tajného logu ve specifickém formátu a komprimování pomocí utility bzip2
+secret_log () {
+    if [ -n "$DIRECTORY" ]; then 
+        dir_filter < "$MOLE_RC" | secret_log_seq | bzip2 -c > "$HOME"/.mole/log_"$USER"_"$DATETIME".bz2
+    else
+        secret_log_seq < "$MOLE_RC" | bzip2 -c > "$HOME"/.mole/log_"$USER"_"$DATETIME".bz2
+    fi
+}
+
+
+
+#############################################################################################################################################################
+#MAIN
+
+#kontrola nastavení MOLE_RC
+molerc_check
+
+
+
+#zpracování argumentů
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h)         print_help; exit 0 ;;
+    -g)         GROUP="$2"; shift ;;
+    -a)         DATE_A="$2"; date_validation "$DATE_A"; shift ;;
+    -b)         DATE_B="$2"; date_validation "$DATE_B"; shift ;;
+    -m)         M=true ;;
+    list)       LIST=true ;;
+    secret-log) SECRET=true ;;
+    --)         shift; break ;;
+    *)          if [ -f "$1" ]; then FILE="$1"; break
+                elif [ -d "$1" ]; then
+                    DIRECTORY="$1"
+                    if [ "$SECRET" = true ]; then 
+                        shift
+                        while [ $# -gt 0 ]; do
+                            DIRECTORY="$DIRECTORY $1"
+                            shift
+                        done
+                    fi; break
+                else echo "ERROR: Neplatný argument: $1">&2; exit 1
+                fi ;;
+  esac
+  shift
+done
+
+
+#mole secret-log
+if [ "$SECRET" = true ]; then
+    secret_log; exit 0
+fi
+
+#pokud nebyl zadán adresář, předpokládá se aktuální adresář
+if [ -z "$DIRECTORY" ]; then
+    DIRECTORY=$(realpath)
+fi
+
+#mole list
+if [ "$LIST" = true ]; then
+    list_files; exit 0
+fi
+
+#s paramterem -m se vybere nejčastěji editovaný soubor (který existuje, tj. nebyl připadně smazán)
+if [ "$M" = true ]; then 
+    file_most_often_edited_in_directory
+fi
+
+#když není daný FILE, vybere se poslední editovaný (který existuje, tj. nebyl připadně smazán)
+if [ -z "$FILE" ]; then 
+    file_last_edited_in_directory
+fi
+
+#stále není daný FILE, tak nebyl nalezen
+if [ -z "$FILE" ]; then 
+    echo "ERROR: V adresáři $DIRECTORY nebyl nenalezen žádný soubor, buď tam není nebo nevyhovuje filtrům">&2
+    exit 1
+fi
+
+#otevře vybraný FILE
+open_file_with_log
+
+#pokud editor vrátí chybu, skript vrátí stejný chybový návratový kód. Interní chyba skriptu bude doprovázena chybovým hlášením
+error=$?
+if [ $error -gt 0 ]; then
+    echo "ERROR: Chybový kód $error při spouštění editoru $EDITOR">&2
+fi
+
+exit $error
